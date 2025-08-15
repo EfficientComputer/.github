@@ -1,0 +1,356 @@
+name: Shared Slack PR Notifications
+
+on:
+  workflow_call:
+    inputs:
+      team_slug:
+        description: 'GitHub team slug to monitor for review requests'
+        required: true
+        type: string
+    secrets:
+      SLACK_BOT_TOKEN:
+        description: 'Slack bot token for posting messages'
+        required: true
+      SLACK_CHANNEL:
+        description: 'Slack channel ID to post notifications'
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  notify-slack:
+    if: github.event_name == 'pull_request' && github.event.action == 'review_requested'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clean up old Slack message metadata
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('🧹 Cleaning up old Slack message metadata before sending new message...');
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            let cleanedCount = 0;
+            
+            console.log(`🔍 Found ${comments.length} total comments to check`);
+            for (const comment of comments) {
+              console.log(`📝 Checking comment ${comment.id}: "${comment.body.substring(0, 100)}..."`);
+              if (comment.body.includes('<!-- SLACK-METADATA-DO-NOT-DELETE')) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    ...context.repo,
+                    comment_id: comment.id
+                  });
+                  cleanedCount++;
+                  console.log(`🗑️  Deleted old metadata comment ${comment.id}`);
+                } catch (error) {
+                  console.log(`⚠️  Could not delete comment ${comment.id}: ${error.message}`);
+                }
+              }
+            }
+            
+            console.log(`✨ Cleaned up ${cleanedCount} old metadata comment(s)`);
+
+      - name: Send Slack notification if team review requested
+        continue-on-error: true
+        id: slack-notify
+        env:
+          SLACK_PR_NOTIFIER_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_PR_NOTIFIER_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TEAM: ${{ github.event.requested_team.slug || '' }}
+          TARGET_TEAM: ${{ inputs.team_slug }}
+        run: |
+          if [ "$TEAM" = "$TARGET_TEAM" ]; then
+            echo "Sending Slack notification for $TARGET_TEAM team review request..."
+            
+            RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+              -H "Authorization: Bearer $SLACK_PR_NOTIFIER_BOT_TOKEN" \
+              -H "Content-type: application/json" \
+              -d "{
+                \"channel\": \"$SLACK_PR_NOTIFIER_CHANNEL\",
+                \"text\": \"Review requested for PR: <$PR_URL|#$PR_NUMBER $PR_TITLE> by <https://github.com/$PR_USER|$PR_USER> 🙏\"
+              }")
+            
+            echo "Slack API response: $RESPONSE"
+            
+            MESSAGE_TS=$(echo "$RESPONSE" | jq -r '.ts // empty')
+            
+            if [ -n "$MESSAGE_TS" ]; then
+              echo "slack_message_ts=$MESSAGE_TS" >> $GITHUB_OUTPUT
+              echo "✅ Message sent with timestamp: $MESSAGE_TS"
+            else
+              echo "❌ Failed to get message timestamp"
+              echo "Response was: $RESPONSE"
+            fi
+          else
+            echo "ℹ️  No Slack message sent: review not requested from $TARGET_TEAM team (was: $TEAM)"
+          fi
+
+      - name: Store Slack message metadata as hidden comment
+        if: steps.slack-notify.outputs.slack_message_ts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const messageTs = "${{ steps.slack-notify.outputs.slack_message_ts }}";
+            const channel = "${{ secrets.SLACK_CHANNEL }}";
+            
+            const metadataComment = "<sub>🤖 Slack notification tracker. 🚫🗑️ Please don't delete!</sub>\n<!-- SLACK-METADATA-DO-NOT-DELETE\n" +
+              JSON.stringify({
+                messageTimestamp: messageTs.toString(),
+                channel: channel,
+                created: new Date().toISOString(),
+                type: "slack-tracking",
+                reviewRequestedBy: "${{ github.event.pull_request.user.login }}",
+                targetTeam: "${{ inputs.team_slug }}"
+              }, null, 2) + "\n-->";
+            
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body: metadataComment
+            });
+            
+            console.log(`✅ Stored metadata for new Slack message ${messageTs}`);
+
+  react-to-review:
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add reviewer checkmark to most recent Slack message
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TARGET_TEAM: ${{ inputs.team_slug }}
+        with:
+          script: |
+            const reviewer = context.payload.review.user.login;
+            console.log(`🔍 Review submitted by ${reviewer} on PR #${context.payload.pull_request.number}`);
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            let mostRecentMessage = null;
+            let mostRecentDate = null;
+            
+            for (const comment of comments) {
+              if (comment.body.includes('<!-- SLACK-METADATA-DO-NOT-DELETE')) {
+                try {
+                  const jsonMatch = comment.body.match(/.*?<!-- SLACK-METADATA-DO-NOT-DELETE\s*\n(\{.*?\})\n-->/s);
+                  if (jsonMatch) {
+                    const metadata = JSON.parse(jsonMatch[1]);
+                    if (metadata.type === 'slack-tracking' && 
+                        metadata.messageTimestamp && 
+                        metadata.targetTeam === process.env.TARGET_TEAM) {
+                      const createdDate = new Date(metadata.created);
+                      if (!mostRecentDate || createdDate > mostRecentDate) {
+                        mostRecentMessage = {
+                          ...metadata,
+                          messageTimestamp: metadata.messageTimestamp.toString()
+                        };
+                        mostRecentDate = createdDate;
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.log(`⚠️  Could not parse metadata comment ${comment.id}:`, e.message);
+                }
+              }
+            }
+            
+            if (!mostRecentMessage) {
+              console.log(`ℹ️  No Slack message found for ${process.env.TARGET_TEAM} team`);
+              return;
+            }
+            
+            console.log(`🎯 Found most recent Slack message: ${mostRecentMessage.messageTimestamp}`);
+            
+            const reviewState = context.payload.review.state || 'commented';
+            
+            const reactionEmojiMap = {
+              'approved': 'white_check_mark',
+              'changes_requested': 'hammer_and_wrench',
+              'commented': 'speech_balloon'
+            };
+            
+            const reactionName = reactionEmojiMap[reviewState] || 'speech_balloon';
+            const emoji = `:${reactionName}:`;
+            
+            let existingReactions = [];
+            try {
+              const reactionsResponse = await fetch(`https://slack.com/api/reactions.get?channel=${mostRecentMessage.channel}&timestamp=${mostRecentMessage.messageTimestamp}`, {
+                headers: {
+                  'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`
+                }
+              });
+              const reactionsData = await reactionsResponse.json();
+              if (reactionsData.ok && reactionsData.message && reactionsData.message.reactions) {
+                existingReactions = reactionsData.message.reactions.map(r => r.name);
+                console.log(`📋 Existing reactions: ${existingReactions.join(', ')}`);
+              }
+            } catch (error) {
+              console.log(`⚠️  Could not fetch existing reactions: ${error.message}`);
+            }
+            
+            if (!existingReactions.includes(reactionName)) {
+              try {
+                console.log(`⏳ Adding ${reactionName} reaction for ${reviewState} review...`);
+                
+                const reactionResponse = await fetch('https://slack.com/api/reactions.add', {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    channel: mostRecentMessage.channel,
+                    name: reactionName,
+                    timestamp: mostRecentMessage.messageTimestamp
+                  })
+                });
+                
+                const reactionResult = await reactionResponse.json();
+                
+                if (reactionResult.ok) {
+                  console.log(`✅ Successfully added ${reactionName} reaction`);
+                } else {
+                  console.log(`⚠️  Failed to add ${reactionName} reaction: ${reactionResult.error}`);
+                }
+              } catch (error) {
+                console.log(`⚠️  Exception while adding ${reactionName} reaction:`, error.message);
+              }
+            } else {
+              console.log(`ℹ️  ${reactionName} reaction already exists, skipping`);
+            }
+            
+            try {
+              console.log(`⏳ Posting thread reply for ${reviewer} (${reviewState})...`);
+              
+              const threadResponse = await fetch('https://slack.com/api/chat.postMessage', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  channel: mostRecentMessage.channel,
+                  thread_ts: mostRecentMessage.messageTimestamp,
+                  text: `${emoji} Review ${reviewState.replace('_', ' ')} by <https://github.com/${reviewer}|${reviewer}>`
+                })
+              });
+              
+              const threadResult = await threadResponse.json();
+              
+              if (threadResult.ok) {
+                console.log(`✅ Successfully posted thread reply for ${reviewer}`);
+              } else {
+                console.log(`❌ Failed to post thread reply: ${threadResult.error}`);
+              }
+            } catch (error) {
+              console.log(`❌ Exception while posting thread reply:`, error.message);
+            }
+
+  update-on-close:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Strike through Slack message when PR is closed
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          TARGET_TEAM: ${{ inputs.team_slug }}
+        with:
+          script: |
+            console.log(`🔒 PR #${context.payload.pull_request.number} was closed, updating Slack message...`);
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number
+            });
+            
+            let mostRecentMessage = null;
+            let mostRecentDate = null;
+            
+            for (const comment of comments) {
+              if (comment.body.includes('<!-- SLACK-METADATA-DO-NOT-DELETE')) {
+                try {
+                  const jsonMatch = comment.body.match(/.*?<!-- SLACK-METADATA-DO-NOT-DELETE\s*\n(\{.*?\})\n-->/s);
+                  if (jsonMatch) {
+                    const metadata = JSON.parse(jsonMatch[1]);
+                    if (metadata.type === 'slack-tracking' && 
+                        metadata.messageTimestamp &&
+                        metadata.targetTeam === process.env.TARGET_TEAM) {
+                      const createdDate = new Date(metadata.created);
+                      if (!mostRecentDate || createdDate > mostRecentDate) {
+                        mostRecentMessage = {
+                          ...metadata,
+                          messageTimestamp: metadata.messageTimestamp.toString()
+                        };
+                        mostRecentDate = createdDate;
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.log(`⚠️  Could not parse metadata comment ${comment.id}:`, e.message);
+                }
+              }
+            }
+            
+            if (!mostRecentMessage) {
+              console.log(`ℹ️  No Slack message found for ${process.env.TARGET_TEAM} team to update`);
+              return;
+            }
+            
+            console.log(`🎯 Found Slack message to update: ${mostRecentMessage.messageTimestamp}`);
+            
+            const prTitle = context.payload.pull_request.title;
+            const prUrl = context.payload.pull_request.html_url;
+            const prNumber = context.payload.pull_request.number;
+            const prUser = mostRecentMessage.reviewRequestedBy;
+            
+            const originalText = `Review requested for PR: <${prUrl}|#${prNumber} ${prTitle}> by <https://github.com/${prUser}|${prUser}>`;
+            
+            const prClosedStatus = context.payload.pull_request.merged ? 'merged' : 'closed';
+            const statusEmoji = context.payload.pull_request.merged ? '🎉' : '📦';
+            const strikethroughText = `~${originalText}~ *${statusEmoji} (${prClosedStatus})*`;
+            
+            console.log(`📝 Updating message with strikethrough...`);
+            
+            try {
+              const updateResponse = await fetch('https://slack.com/api/chat.update', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  channel: mostRecentMessage.channel,
+                  ts: mostRecentMessage.messageTimestamp,
+                  text: strikethroughText
+                })
+              });
+              
+              const updateResult = await updateResponse.json();
+              
+              if (updateResult.ok) {
+                console.log(`✅ Successfully updated Slack message with strikethrough (${prClosedStatus})`);
+              } else {
+                console.log(`❌ Failed to update message: ${updateResult.error}`);
+              }
+              
+            } catch (error) {
+              console.log(`❌ Exception while updating message:`, error.message);
+            }
