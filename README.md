@@ -28,6 +28,11 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   slack-notifications:
     uses: Efficient-Computer/.github/.github/workflows/slack-pr-notifications.yml@main
